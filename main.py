@@ -4,7 +4,7 @@ import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from auth import hash_password, create_access_token, verify_password, decode_access_token
 from pydantic import BaseModel
@@ -15,9 +15,62 @@ SATIETY_ALERT_THRESHOLD = 30
 
 app = FastAPI(title="Tamagotchi Server")
 
+
+class ConnectionManager:
+    def __init__(self):
+        self.pet_connections: dict[int, list[dict]] = {}
+
+    async def connect(self, pet_id: int, user_id: int, websocket: WebSocket):
+        await websocket.accept()
+        self.pet_connections.setdefault(pet_id, []).append(
+            {"user_id": user_id, "websocket": websocket}
+        )
+
+    def disconnect(self, pet_id: int, websocket: WebSocket):
+        if pet_id not in self.pet_connections:
+            return
+
+        self.pet_connections[pet_id] = [
+            item for item in self.pet_connections[pet_id]
+            if item["websocket"] is not websocket
+        ]
+
+        if not self.pet_connections[pet_id]:
+            del self.pet_connections[pet_id]
+
+    async def broadcast_pet_state(self, pet_id: int):
+        if pet_id not in self.pet_connections:
+            return
+
+        dead_connections = []
+
+        for item in list(self.pet_connections[pet_id]):
+            websocket = item["websocket"]
+            user_id = item["user_id"]
+
+            try:
+                payload = get_pet_payload_for_user(user_id, pet_id)
+                await websocket.send_json(payload)
+            except HTTPException:
+                dead_connections.append(websocket)
+            except Exception:
+                dead_connections.append(websocket)
+
+        for websocket in dead_connections:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            self.disconnect(pet_id, websocket)
+
+
+manager = ConnectionManager()
+
+
 class RegisterRequest(BaseModel):
     username: str
     password: str
+
 
 class InviteRequest(BaseModel):
     username: str
@@ -36,6 +89,7 @@ def get_conn():
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def get_user_id_from_auth_header(authorization: str | None):
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
@@ -44,30 +98,23 @@ def get_user_id_from_auth_header(authorization: str | None):
         raise HTTPException(status_code=401, detail="Invalid Authorization header")
 
     token = authorization[len("Bearer "):].strip()
-    user_id = decode_access_token(token)
+    return get_user_id_from_token(token)
 
+
+def get_user_id_from_token(token: str):
+    user_id = decode_access_token(token)
     if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
-
     return user_id
+
+
+def column_exists(conn, table_name: str, column_name: str) -> bool:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return any(row[1] == column_name for row in rows)
+
 
 def init_db():
     with closing(get_conn()) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS pet (
-                id INTEGER PRIMARY KEY,
-                name TEXT,
-                satiety INTEGER,
-                mood INTEGER,
-                energy INTEGER,
-                sleeping INTEGER,
-                satiety_alert_30_sent INTEGER,
-                updated_at TEXT
-            )
-            """
-        )
-
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -79,45 +126,79 @@ def init_db():
             """
         )
 
-        pet = conn.execute("SELECT * FROM pet WHERE id = 1").fetchone()
-
-        if pet is None:
-            conn.execute(
-                """
-                INSERT INTO pet (
-                    id, name, satiety, mood, energy, sleeping,
-                    satiety_alert_30_sent, updated_at
-                )
-                VALUES (1, 'Muffin', 80, 80, 70, 0, 0, ?)
-                """,
-                (utc_now(),)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pet (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                satiety INTEGER,
+                mood INTEGER,
+                energy INTEGER,
+                sleeping INTEGER,
+                satiety_alert_30_sent INTEGER,
+                updated_at TEXT,
+                owner_id INTEGER,
+                care_type TEXT NOT NULL DEFAULT 'solo'
             )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pet_access (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pet_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pet_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pet_id INTEGER NOT NULL,
+                from_user_id INTEGER NOT NULL,
+                to_user_id INTEGER NOT NULL,
+                request_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                responded_at TEXT
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pet_requests_to_user_status
+            ON pet_requests(to_user_id, status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_pet_requests_pet_id
+            ON pet_requests(pet_id)
+            """
+        )
+
+        if not column_exists(conn, "pet", "owner_id"):
+            conn.execute("ALTER TABLE pet ADD COLUMN owner_id INTEGER")
+
+        if not column_exists(conn, "pet", "care_type"):
+            conn.execute("ALTER TABLE pet ADD COLUMN care_type TEXT NOT NULL DEFAULT 'solo'")
 
         conn.commit()
 
 
-def get_pet():
+def get_all_pets():
     with closing(get_conn()) as conn:
-        row = conn.execute("SELECT * FROM pet WHERE id = 1").fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Pet not found")
-        return dict(row)
+        rows = conn.execute("SELECT * FROM pet ORDER BY id").fetchall()
+        return [dict(row) for row in rows]
 
 
-def get_pet_by_owner_id(owner_id: int):
-    with closing(get_conn()) as conn:
-        row = conn.execute(
-            "SELECT * FROM pet WHERE owner_id = ?",
-            (owner_id,)
-        ).fetchone()
-
-        if row is None:
-            raise HTTPException(status_code=404, detail="Pet not found")
-
-        return dict(row)
-
-
-def save_pet(pet):
+def save_pet(pet: dict):
     with closing(get_conn()) as conn:
         conn.execute(
             """
@@ -129,7 +210,8 @@ def save_pet(pet):
                 sleeping = ?,
                 satiety_alert_30_sent = ?,
                 updated_at = ?,
-                owner_id = ?
+                owner_id = ?,
+                care_type = ?
             WHERE id = ?
             """,
             (
@@ -140,16 +222,15 @@ def save_pet(pet):
                 pet["sleeping"],
                 pet["satiety_alert_30_sent"],
                 pet["updated_at"],
-                pet["owner_id"],
+                pet.get("owner_id"),
+                pet.get("care_type", "solo"),
                 pet["id"],
             ),
         )
         conn.commit()
 
 
-def update_pet_state():
-    pet = get_pet()
-
+def update_pet_state_for_one(pet: dict):
     if pet["sleeping"]:
         pet["energy"] = clamp(pet["energy"] + random.randint(1, 3))
         pet["satiety"] = clamp(pet["satiety"] - random.randint(0, 1))
@@ -159,19 +240,92 @@ def update_pet_state():
         pet["mood"] = clamp(pet["mood"] - random.randint(0, 2))
         pet["energy"] = clamp(pet["energy"] - random.randint(0, 2))
 
-    if pet["satiety"] <= SATIETY_ALERT_THRESHOLD:
-        pet["satiety_alert_30_sent"] = 1
-    else:
-        pet["satiety_alert_30_sent"] = 0
-
+    pet["satiety_alert_30_sent"] = 1 if pet["satiety"] <= SATIETY_ALERT_THRESHOLD else 0
     pet["updated_at"] = utc_now()
     save_pet(pet)
+
+
+def get_pet_for_user(user_id: int, pet_id: int):
+    with closing(get_conn()) as conn:
+        access = conn.execute(
+            """
+            SELECT role FROM pet_access
+            WHERE pet_id = ? AND user_id = ?
+            """,
+            (pet_id, user_id)
+        ).fetchone()
+
+        if access is None:
+            raise HTTPException(status_code=403, detail="No access to this pet")
+
+        pet = conn.execute(
+            "SELECT * FROM pet WHERE id = ?",
+            (pet_id,)
+        ).fetchone()
+
+        if pet is None:
+            raise HTTPException(status_code=404, detail="Pet not found")
+
+        return dict(pet)
+
+
+def get_shared_usernames(conn: sqlite3.Connection, pet_id: int, exclude_user_id: int | None = None):
+    params = [pet_id]
+    sql = """
+        SELECT users.username
+        FROM pet_access
+        JOIN users ON users.id = pet_access.user_id
+        WHERE pet_access.pet_id = ?
+          AND pet_access.role = 'parent'
+    """
+
+    if exclude_user_id is not None:
+        sql += " AND pet_access.user_id != ?"
+        params.append(exclude_user_id)
+
+    sql += " ORDER BY users.username COLLATE NOCASE"
+
+    rows = conn.execute(sql, tuple(params)).fetchall()
+    return [row["username"] for row in rows]
+
+
+def get_pet_payload_for_user(user_id: int, pet_id: int):
+    with closing(get_conn()) as conn:
+        access = conn.execute(
+            """
+            SELECT 1 FROM pet_access
+            WHERE pet_id = ? AND user_id = ? AND role = 'parent'
+            """,
+            (pet_id, user_id)
+        ).fetchone()
+
+        if access is None:
+            raise HTTPException(status_code=403, detail="No access to this pet")
+
+        pet = conn.execute(
+            "SELECT * FROM pet WHERE id = ?",
+            (pet_id,)
+        ).fetchone()
+
+        if pet is None:
+            raise HTTPException(status_code=404, detail="Pet not found")
+
+        data = dict(pet)
+        data["shared_with"] = get_shared_usernames(conn, pet_id, exclude_user_id=user_id)
+        return data
+
+
+async def update_all_pets_state():
+    pets = get_all_pets()
+    for pet in pets:
+        update_pet_state_for_one(pet)
+        await manager.broadcast_pet_state(pet["id"])
 
 
 async def pet_loop():
     while True:
         await asyncio.sleep(TICK_SECONDS)
-        update_pet_state()
+        await update_all_pets_state()
 
 
 @app.on_event("startup")
@@ -185,10 +339,29 @@ def root():
     return {"status": "ok"}
 
 
-@app.get("/pet")
-def read_pet():
-    return get_pet()
+@app.websocket("/ws/pets/{pet_id}")
+async def websocket_pet(websocket: WebSocket, pet_id: int, token: str = Query(...)):
+    try:
+        user_id = get_user_id_from_token(token)
+        payload = get_pet_payload_for_user(user_id, pet_id)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
 
+    await manager.connect(pet_id, user_id, websocket)
+
+    try:
+        await websocket.send_json(payload)
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(pet_id, websocket)
+    except Exception:
+        manager.disconnect(pet_id, websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.get("/pet/view", response_class=HTMLResponse)
@@ -202,8 +375,10 @@ def pet_view():
         <body style="font-family: Arial; max-width: 600px; margin: 40px auto;">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <h1>Мой питомец</h1>
-                <button onclick="window.location.href='/pets/select'">Сменить питомца</button>
-		<button onclick="logout()">Выйти</button>
+                <div style="display:flex; gap:8px;">
+                    <button onclick="window.location.href='/pets/select'">Сменить питомца</button>
+                    <button onclick="logout()">Выйти</button>
+                </div>
             </div>
 
             <p id="user" style="color:gray;"></p>
@@ -230,6 +405,8 @@ def pet_view():
             <p id="message" style="margin-top: 16px;"></p>
 
             <script>
+                let petSocket = null;
+                let reconnectTimer = null;
 
                 function logout() {
                     localStorage.removeItem("access_token");
@@ -242,19 +419,23 @@ def pet_view():
 
                 async function inviteUser() {
                     const token = localStorage.getItem("access_token");
+                    const petId = localStorage.getItem("selected_pet_id");
                     const username = document.getElementById("inviteUsername").value;
 
                     const response = await fetch("/pets/invite", {
                         method: "POST",
                         headers: {
                             "Content-Type": "application/json",
-                            "Authorization": "Bearer " + token
+                            "Authorization": "Bearer " + token,
+                            "X-Pet-Id": petId
                         },
                         body: JSON.stringify({ username })
                     });
 
                     const data = await response.json();
-                    document.getElementById("message").innerText = response.ok ? "Приглашение отправлено" : (data.detail || "Ошибка");
+                    document.getElementById("message").innerText = response.ok
+                        ? "Приглашение отправлено"
+                        : (data.detail || "Ошибка");
                 }
 
                 async function requestUnshare() {
@@ -269,7 +450,9 @@ def pet_view():
                     });
 
                     const data = await response.json();
-                    document.getElementById("message").innerText = response.ok ? "Запрос на расторжение отправлен" : (data.detail || "Ошибка");
+                    document.getElementById("message").innerText = response.ok
+                        ? "Запрос на расторжение отправлен"
+                        : (data.detail || "Ошибка");
                 }
 
                 async function loadUser() {
@@ -287,57 +470,92 @@ def pet_view():
                     }
                 }
 
-async function loadPet() {
-    const token = localStorage.getItem("access_token");
-    const petId = localStorage.getItem("selected_pet_id");
+                function renderPet(pet) {
+                    const sleepingText = pet.sleeping ? "Да 😴" : "Нет 🙂";
+                    const careTypeText = pet.care_type === "shared" ? "совместное" : "одиночное";
+                    const updatedText = new Date(pet.updated_at).toLocaleString("ru-RU", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        year: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        second: "2-digit"
+                    });
 
-    if (!token) {
-        window.location.href = "/login";
-        return;
-    }
+                    let sharedHtml = "";
+                    if (pet.care_type === "shared" && pet.shared_with && pet.shared_with.length > 0) {
+                        sharedHtml = `<p><b>Совместно с:</b> ${pet.shared_with.join(", ")}</p>`;
+                    }
 
-    if (!petId) {
-        window.location.href = "/pets/select";
-        return;
-    }
+                    document.getElementById("pet").innerHTML = `
+                        <p><b>Имя:</b> ${pet.name}</p>
+                        <p><b>Воспитание:</b> ${careTypeText}</p>
+                        ${sharedHtml}
+                        <p><b>Сытость:</b> ${pet.satiety}</p>
+                        <p><b>Настроение:</b> ${pet.mood}</p>
+                        <p><b>Энергия:</b> ${pet.energy}</p>
+                        <p><b>Спит:</b> ${sleepingText}</p>
+                        <p><b>Обновлён:</b> ${updatedText}</p>
+                    `;
+                }
 
-    const response = await fetch("/pets/" + petId, {
-        headers: {
-            "Authorization": "Bearer " + token
-        }
-    });
+                function connectPetSocket() {
+                    const token = localStorage.getItem("access_token");
+                    const petId = localStorage.getItem("selected_pet_id");
 
-    if (!response.ok) {
-        document.getElementById("pet").innerText = "Не удалось загрузить питомца";
-        return;
-    }
+                    if (!token) {
+                        window.location.href = "/login";
+                        return;
+                    }
 
-    const pet = await response.json();
-    const sleepingText = pet.sleeping ? "Да 😴" : "Нет 🙂";
-    const roleText = pet.role === "parent" ? "родитель" : pet.role;
-    const careTypeText = pet.care_type === "shared" ? "совместное" : "одиночное";
-    const updatedText = new Date(pet.updated_at).toLocaleString("ru-RU", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit"
-    });
+                    if (!petId) {
+                        window.location.href = "/pets/select";
+                        return;
+                    }
 
-    document.getElementById("pet").innerHTML = `
-        <p><b>Имя:</b> ${pet.name}</p>
-        <p><b>Роль:</b> ${roleText}</p>
-        <p><b>Воспитание:</b> ${careTypeText}</p>
-        <p><b>Сытость:</b> ${pet.satiety}</p>
-        <p><b>Настроение:</b> ${pet.mood}</p>
-        <p><b>Энергия:</b> ${pet.energy}</p>
-        <p><b>Спит:</b> ${sleepingText}</p>
-        <p><b>Обновлён:</b> ${updatedText}</p>
-    `;
-}
+                    if (petSocket) {
+                        petSocket.close();
+                    }
+
+                    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+                    petSocket = new WebSocket(`${protocol}://${window.location.host}/ws/pets/${petId}?token=${encodeURIComponent(token)}`);
+
+                    petSocket.onopen = () => {
+                        if (petSocket._heartbeat) {
+                            clearInterval(petSocket._heartbeat);
+                        }
+                        petSocket._heartbeat = setInterval(() => {
+                            if (petSocket && petSocket.readyState === WebSocket.OPEN) {
+                                petSocket.send("ping");
+                            }
+                        }, 20000);
+                    };
+
+                    petSocket.onmessage = (event) => {
+                        const pet = JSON.parse(event.data);
+                        renderPet(pet);
+                    };
+
+                    petSocket.onclose = () => {
+                        if (petSocket && petSocket._heartbeat) {
+                            clearInterval(petSocket._heartbeat);
+                        }
+                        if (reconnectTimer) {
+                            clearTimeout(reconnectTimer);
+                        }
+                        reconnectTimer = setTimeout(connectPetSocket, 2000);
+                    };
+
+                    petSocket.onerror = () => {
+                        if (petSocket) {
+                            petSocket.close();
+                        }
+                    };
+                }
 
                 async function action(url) {
                     const token = localStorage.getItem("access_token");
+                    const petId = localStorage.getItem("selected_pet_id");
 
                     if (!token) {
                         window.location.href = "/login";
@@ -347,7 +565,8 @@ async function loadPet() {
                     const response = await fetch(url, {
                         method: "POST",
                         headers: {
-                            "Authorization": "Bearer " + token
+                            "Authorization": "Bearer " + token,
+                            "X-Pet-Id": petId
                         }
                     });
 
@@ -359,14 +578,10 @@ async function loadPet() {
                     }
 
                     document.getElementById("message").innerText = "Действие выполнено";
-                    loadPet();
                 }
 
                 loadUser();
-                loadPet();
-
-
-		setInterval(loadPet, 1000)
+                connectPetSocket();
             </script>
         </body>
     </html>
@@ -374,21 +589,36 @@ async function loadPet() {
 
 
 @app.post("/pet/feed")
-def feed_pet(authorization: str | None = Header(default=None)):
+async def feed_pet(
+    authorization: str | None = Header(default=None),
+    pet_id: int | None = Header(default=None, alias="X-Pet-Id")
+):
     user_id = get_user_id_from_auth_header(authorization)
-    pet = get_pet_by_owner_id(user_id)
 
+    if pet_id is None:
+        raise HTTPException(status_code=400, detail="Missing pet id")
+
+    pet = get_pet_for_user(user_id, pet_id)
     pet["satiety"] = clamp(pet["satiety"] + random.randint(8, 15))
     pet["mood"] = clamp(pet["mood"] + random.randint(1, 4))
     pet["updated_at"] = utc_now()
-
     save_pet(pet)
-    return pet
+
+    await manager.broadcast_pet_state(pet_id)
+    return get_pet_payload_for_user(user_id, pet_id)
+
 
 @app.post("/pet/play")
-def play_with_pet(authorization: str | None = Header(default=None)):
+async def play_with_pet(
+    authorization: str | None = Header(default=None),
+    pet_id: int | None = Header(default=None, alias="X-Pet-Id")
+):
     user_id = get_user_id_from_auth_header(authorization)
-    pet = get_pet_by_owner_id(user_id)
+
+    if pet_id is None:
+        raise HTTPException(status_code=400, detail="Missing pet id")
+
+    pet = get_pet_for_user(user_id, pet_id)
 
     if pet["sleeping"]:
         raise HTTPException(status_code=400, detail="Pet is sleeping")
@@ -397,31 +627,49 @@ def play_with_pet(authorization: str | None = Header(default=None)):
     pet["energy"] = clamp(pet["energy"] - random.randint(4, 8))
     pet["satiety"] = clamp(pet["satiety"] - random.randint(2, 5))
     pet["updated_at"] = utc_now()
-
     save_pet(pet)
-    return pet
+
+    await manager.broadcast_pet_state(pet_id)
+    return get_pet_payload_for_user(user_id, pet_id)
+
 
 @app.post("/pet/sleep")
-def put_pet_to_sleep(authorization: str | None = Header(default=None)):
+async def put_pet_to_sleep(
+    authorization: str | None = Header(default=None),
+    pet_id: int | None = Header(default=None, alias="X-Pet-Id")
+):
     user_id = get_user_id_from_auth_header(authorization)
-    pet = get_pet_by_owner_id(user_id)
 
+    if pet_id is None:
+        raise HTTPException(status_code=400, detail="Missing pet id")
+
+    pet = get_pet_for_user(user_id, pet_id)
     pet["sleeping"] = 1
     pet["updated_at"] = utc_now()
-
     save_pet(pet)
-    return pet
+
+    await manager.broadcast_pet_state(pet_id)
+    return get_pet_payload_for_user(user_id, pet_id)
+
 
 @app.post("/pet/wake")
-def wake_pet(authorization: str | None = Header(default=None)):
+async def wake_pet(
+    authorization: str | None = Header(default=None),
+    pet_id: int | None = Header(default=None, alias="X-Pet-Id")
+):
     user_id = get_user_id_from_auth_header(authorization)
-    pet = get_pet_by_owner_id(user_id)
 
+    if pet_id is None:
+        raise HTTPException(status_code=400, detail="Missing pet id")
+
+    pet = get_pet_for_user(user_id, pet_id)
     pet["sleeping"] = 0
     pet["updated_at"] = utc_now()
-
     save_pet(pet)
-    return pet
+
+    await manager.broadcast_pet_state(pet_id)
+    return get_pet_payload_for_user(user_id, pet_id)
+
 
 @app.post("/auth/register")
 def register(data: RegisterRequest):
@@ -470,8 +718,8 @@ def register(data: RegisterRequest):
         )
 
         pet_id = conn.execute(
-        	"SELECT id FROM pet WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
-        	(user_id,)
+            "SELECT id FROM pet WHERE owner_id = ? ORDER BY id DESC LIMIT 1",
+            (user_id,)
         ).fetchone()["id"]
 
         conn.execute(
@@ -487,7 +735,6 @@ def register(data: RegisterRequest):
             )
         )
 
-
         conn.commit()
 
         access_token = create_access_token(user_id)
@@ -498,6 +745,7 @@ def register(data: RegisterRequest):
             "user_id": user_id,
             "username": data.username,
         }
+
 
 @app.post("/auth/login")
 def login(data: RegisterRequest):
@@ -522,20 +770,22 @@ def login(data: RegisterRequest):
             "username": user["username"],
         }
 
+
 @app.get("/pets/my")
 def get_my_pet(authorization: str | None = Header(default=None)):
     user_id = get_user_id_from_auth_header(authorization)
 
     with closing(get_conn()) as conn:
         pet = conn.execute(
-            "SELECT * FROM pet WHERE owner_id = ?",
+            "SELECT id FROM pet WHERE owner_id = ? ORDER BY id LIMIT 1",
             (user_id,)
         ).fetchone()
 
         if pet is None:
             raise HTTPException(status_code=404, detail="Pet not found")
 
-        return dict(pet)
+        return get_pet_payload_for_user(user_id, pet["id"])
+
 
 @app.get("/users/me")
 def get_me(authorization: str | None = Header(default=None)):
@@ -551,6 +801,7 @@ def get_me(authorization: str | None = Header(default=None)):
             raise HTTPException(status_code=404, detail="User not found")
 
         return dict(user)
+
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
@@ -576,13 +827,12 @@ def login_page():
 
                 <button type="submit" style="padding: 10px 16px;">Войти</button>
             </form>
-		
-		<p id="result" style="margin-top: 16px;"></p>
 
-		<p style="margin-top: 20px;">
-    			Нет аккаунта? <a href="/register">Зарегистрироваться</a>
-		</p>
+            <p id="result" style="margin-top: 16px;"></p>
 
+            <p style="margin-top: 20px;">
+                Нет аккаунта? <a href="/register">Зарегистрироваться</a>
+            </p>
 
             <script>
                 const form = document.getElementById("login-form");
@@ -610,12 +860,13 @@ def login_page():
                     }
 
                     localStorage.setItem("access_token", data.access_token);
-			window.location.href = "/pet/view";
+                    window.location.href = "/pet/view";
                 });
             </script>
         </body>
     </html>
     """
+
 
 @app.get("/register", response_class=HTMLResponse)
 def register_page():
@@ -681,27 +932,29 @@ def register_page():
     </html>
     """
 
+
 @app.post("/pets/invite")
-def invite_user(data: InviteRequest, authorization: str | None = Header(default=None)):
+def invite_user(
+    data: InviteRequest,
+    authorization: str | None = Header(default=None),
+    pet_id: int | None = Header(default=None, alias="X-Pet-Id")
+):
     user_id = get_user_id_from_auth_header(authorization)
 
+    if pet_id is None:
+        raise HTTPException(status_code=400, detail="Missing pet id")
+
     with closing(get_conn()) as conn:
-        pet = conn.execute(
+        my_access = conn.execute(
             """
-            SELECT pet.id, pet.name
-            FROM pet
-            JOIN pet_access ON pet.id = pet_access.pet_id
-            WHERE pet_access.user_id = ? AND pet_access.role = 'parent'
-            ORDER BY pet.id
-            LIMIT 1
+            SELECT id FROM pet_access
+            WHERE pet_id = ? AND user_id = ? AND role = 'parent'
             """,
-            (user_id,)
+            (pet_id, user_id)
         ).fetchone()
 
-        if pet is None:
-            raise HTTPException(status_code=404, detail="Pet not found")
-
-        pet_id = pet["id"]
+        if my_access is None:
+            raise HTTPException(status_code=403, detail="Only a parent can invite")
 
         target_user = conn.execute(
             "SELECT id FROM users WHERE username = ?",
@@ -749,8 +1002,8 @@ def invite_user(data: InviteRequest, authorization: str | None = Header(default=
         )
 
         conn.commit()
-
         return {"status": "pending_invite_created"}
+
 
 @app.get("/requests/incoming")
 def get_incoming_requests(authorization: str | None = Header(default=None)):
@@ -808,8 +1061,9 @@ def get_outgoing_requests(authorization: str | None = Header(default=None)):
 
 
 @app.post("/requests/{request_id}/accept")
-def accept_request(request_id: int, authorization: str | None = Header(default=None)):
+async def accept_request(request_id: int, authorization: str | None = Header(default=None)):
     user_id = get_user_id_from_auth_header(authorization)
+    affected_pet_id = None
 
     with closing(get_conn()) as conn:
         request_row = conn.execute(
@@ -825,6 +1079,8 @@ def accept_request(request_id: int, authorization: str | None = Header(default=N
 
         if request_row["status"] != "pending":
             raise HTTPException(status_code=400, detail="Request is not pending")
+
+        affected_pet_id = request_row["pet_id"]
 
         if request_row["request_type"] == "parent_invite":
             existing_access = conn.execute(
@@ -879,7 +1135,10 @@ def accept_request(request_id: int, authorization: str | None = Header(default=N
 
         conn.commit()
 
-        return {"status": "accepted"}
+    if affected_pet_id is not None:
+        await manager.broadcast_pet_state(affected_pet_id)
+
+    return {"status": "accepted"}
 
 
 @app.post("/requests/{request_id}/decline")
@@ -957,7 +1216,6 @@ def create_unshare_request(pet_id: int, authorization: str | None = Header(defau
         )
 
         conn.commit()
-
         return {"status": "pending_unshare_created"}
 
 
@@ -1092,7 +1350,6 @@ def requests_view():
     """
 
 
-
 @app.get("/pets")
 def get_my_pets(authorization: str | None = Header(default=None)):
     user_id = get_user_id_from_auth_header(authorization)
@@ -1100,27 +1357,17 @@ def get_my_pets(authorization: str | None = Header(default=None)):
     with closing(get_conn()) as conn:
         rows = conn.execute(
             """
-            SELECT
-                pet.id,
-                pet.name,
-                pet.satiety,
-                pet.mood,
-                pet.energy,
-                pet.sleeping,
-                pet.satiety_alert_30_sent,
-                pet.updated_at,
-                pet.owner_id,
-                pet.care_type,
-                pet_access.role
+            SELECT pet.id
             FROM pet
             JOIN pet_access ON pet.id = pet_access.pet_id
-            WHERE pet_access.user_id = ?
+            WHERE pet_access.user_id = ? AND pet_access.role = 'parent'
             ORDER BY pet.id
             """,
             (user_id,)
         ).fetchall()
 
-        return [dict(row) for row in rows]
+    return [get_pet_payload_for_user(user_id, row["id"]) for row in rows]
+
 
 @app.get("/pets/select", response_class=HTMLResponse)
 def pets_select_page():
@@ -1162,14 +1409,21 @@ def pets_select_page():
                         return;
                     }
 
-                    document.getElementById("pets").innerHTML = pets.map(p => `
-                        <div style="border:1px solid #ccc; padding:12px; margin-bottom:10px;">
-                            <p><b>${p.name}</b></p>
-                            <p>Роль: ${p.role === "parent" ? "родитель" : p.role}</p>
-                            <p>Воспитание: ${p.care_type === "shared" ? "совместное" : "одиночное"}</p>
-                            <button onclick="selectPet(${p.id})">Открыть</button>
-                        </div>
-                    `).join("");
+                    document.getElementById("pets").innerHTML = pets.map(p => {
+                        const careType = p.care_type === "shared" ? "совместное" : "одиночное";
+                        const sharedWith = p.care_type === "shared" && p.shared_with && p.shared_with.length > 0
+                            ? `<p>Совместно с: ${p.shared_with.join(", ")}</p>`
+                            : "";
+
+                        return `
+                            <div style="border:1px solid #ccc; padding:12px; margin-bottom:10px;">
+                                <p><b>${p.name}</b></p>
+                                <p>Воспитание: ${careType}</p>
+                                ${sharedWith}
+                                <button onclick="selectPet(${p.id})">Открыть</button>
+                            </div>
+                        `;
+                    }).join("");
                 }
 
                 function selectPet(petId) {
@@ -1187,30 +1441,4 @@ def pets_select_page():
 @app.get("/pets/{pet_id}")
 def get_pet_by_id(pet_id: int, authorization: str | None = Header(default=None)):
     user_id = get_user_id_from_auth_header(authorization)
-
-    with closing(get_conn()) as conn:
-
-        access = conn.execute(
-            """
-            SELECT role FROM pet_access
-            WHERE pet_id = ? AND user_id = ?
-            """,
-            (pet_id, user_id)
-        ).fetchone()
-
-        if access is None:
-            raise HTTPException(status_code=403, detail="No access to this pet")
-
-        pet = conn.execute(
-            "SELECT * FROM pet WHERE id = ?",
-            (pet_id,)
-        ).fetchone()
-
-        if pet is None:
-            raise HTTPException(status_code=404, detail="Pet not found")
-
-        data = dict(pet)
-        data["role"] = access["role"]
-
-        return data
-
+    return get_pet_payload_for_user(user_id, pet_id)
