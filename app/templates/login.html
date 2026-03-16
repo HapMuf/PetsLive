@@ -1,0 +1,59 @@
+<html>
+    <head>
+        <title>Login - Tamagotchi</title>
+        <meta charset="utf-8">
+    </head>
+    <body style="font-family: Arial; max-width: 420px; margin: 40px auto;">
+        <h1>Вход</h1>
+
+        <form id="login-form">
+            <div style="margin-bottom: 12px;">
+                <label>Логин</label><br>
+                <input id="username" type="text" style="width: 100%; padding: 8px;" />
+            </div>
+
+            <div style="margin-bottom: 12px;">
+                <label>Пароль</label><br>
+                <input id="password" type="password" style="width: 100%; padding: 8px;" />
+            </div>
+
+            <button type="submit" style="padding: 10px 16px;">Войти</button>
+        </form>
+
+        <p id="result" style="margin-top: 16px;"></p>
+
+        <p style="margin-top: 20px;">
+            Нет аккаунта? <a href="/register">Зарегистрироваться</a>
+        </p>
+
+        <script>
+            const form = document.getElementById("login-form");
+            const result = document.getElementById("result");
+
+            form.addEventListener("submit", async (e) => {
+                e.preventDefault();
+
+                const username = document.getElementById("username").value;
+                const password = document.getElementById("password").value;
+
+                const response = await fetch("/auth/login", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    result.innerText = data.detail || "Ошибка входа";
+                    return;
+                }
+
+                localStorage.setItem("access_token", data.access_token);
+                window.location.href = "/pet/view";
+            });
+        </script>
+    </body>
+</html>

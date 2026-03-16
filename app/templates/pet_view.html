@@ -1,0 +1,218 @@
+<html>
+    <head>
+        <title>Tamagotchi</title>
+        <meta charset="utf-8">
+    </head>
+    <body style="font-family: Arial; max-width: 600px; margin: 40px auto;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h1>Мой питомец</h1>
+            <div style="display:flex; gap:8px;">
+                <button onclick="window.location.href='/pets/select'">Сменить питомца</button>
+                <button onclick="logout()">Выйти</button>
+            </div>
+        </div>
+
+        <p id="user" style="color:gray;"></p>
+
+        <div id="pet">Загрузка...</div>
+
+        <div style="margin-top: 20px; display: flex; gap: 10px; flex-wrap: wrap;">
+            <button onclick="action('/pet/feed')">Покормить</button>
+            <button onclick="action('/pet/play')">Поиграть</button>
+            <button onclick="action('/pet/sleep')">Уложить спать</button>
+            <button onclick="action('/pet/wake')">Разбудить</button>
+        </div>
+
+        <div style="margin-top: 24px; border:1px solid #ddd; padding:12px;">
+            <p><b>Совместное воспитание</b></p>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input id="inviteUsername" type="text" placeholder="Логин пользователя" style="padding:8px;" />
+                <button onclick="inviteUser()">Пригласить</button>
+                <button onclick="openRequests()">Открыть запросы</button>
+                <button onclick="requestUnshare()">Предложить расторгнуть</button>
+            </div>
+        </div>
+
+        <p id="message" style="margin-top: 16px;"></p>
+
+        <script>
+            let petSocket = null;
+            let reconnectTimer = null;
+
+            function logout() {
+                localStorage.removeItem("access_token");
+                window.location.href = "/login";
+            }
+
+            function openRequests() {
+                window.location.href = "/requests/view";
+            }
+
+            async function inviteUser() {
+                const token = localStorage.getItem("access_token");
+                const petId = localStorage.getItem("selected_pet_id");
+                const username = document.getElementById("inviteUsername").value;
+
+                const response = await fetch("/pets/invite", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token,
+                        "X-Pet-Id": petId
+                    },
+                    body: JSON.stringify({ username })
+                });
+
+                const data = await response.json();
+                document.getElementById("message").innerText = response.ok
+                    ? "Приглашение отправлено"
+                    : (data.detail || "Ошибка");
+            }
+
+            async function requestUnshare() {
+                const token = localStorage.getItem("access_token");
+                const petId = localStorage.getItem("selected_pet_id");
+
+                const response = await fetch(`/pets/${petId}/unshare-request`, {
+                    method: "POST",
+                    headers: {
+                        "Authorization": "Bearer " + token
+                    }
+                });
+
+                const data = await response.json();
+                document.getElementById("message").innerText = response.ok
+                    ? "Запрос на расторжение отправлен"
+                    : (data.detail || "Ошибка");
+            }
+
+            async function loadUser() {
+                const token = localStorage.getItem("access_token");
+
+                const response = await fetch("/users/me", {
+                    headers: {
+                        "Authorization": "Bearer " + token
+                    }
+                });
+
+                if (response.ok) {
+                    const user = await response.json();
+                    document.getElementById("user").innerText = "Вы вошли как: " + user.username;
+                }
+            }
+
+            function renderPet(pet) {
+                const sleepingText = pet.sleeping ? "Да 😴" : "Нет 🙂";
+                const careTypeText = pet.care_type === "shared" ? "совместное" : "одиночное";
+                const updatedText = new Date(pet.updated_at).toLocaleString("ru-RU", {
+                    day: "2-digit",
+                    month: "2-digit",
+                    year: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit"
+                });
+
+                let sharedHtml = "";
+                if (pet.care_type === "shared" && pet.shared_with && pet.shared_with.length > 0) {
+                    sharedHtml = `<p><b>Совместно с:</b> ${pet.shared_with.join(", ")}</p>`;
+                }
+
+                document.getElementById("pet").innerHTML = `
+                    <p><b>Имя:</b> ${pet.name}</p>
+                    <p><b>Воспитание:</b> ${careTypeText}</p>
+                    ${sharedHtml}
+                    <p><b>Сытость:</b> ${pet.satiety}</p>
+                    <p><b>Настроение:</b> ${pet.mood}</p>
+                    <p><b>Энергия:</b> ${pet.energy}</p>
+                    <p><b>Спит:</b> ${sleepingText}</p>
+                    <p><b>Обновлён:</b> ${updatedText}</p>
+                `;
+            }
+
+            function connectPetSocket() {
+                const token = localStorage.getItem("access_token");
+                const petId = localStorage.getItem("selected_pet_id");
+
+                if (!token) {
+                    window.location.href = "/login";
+                    return;
+                }
+
+                if (!petId) {
+                    window.location.href = "/pets/select";
+                    return;
+                }
+
+                if (petSocket) {
+                    petSocket.close();
+                }
+
+                const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+                petSocket = new WebSocket(`${protocol}://${window.location.host}/ws/pets/${petId}?token=${encodeURIComponent(token)}`);
+
+                petSocket.onopen = () => {
+                    if (petSocket._heartbeat) {
+                        clearInterval(petSocket._heartbeat);
+                    }
+                    petSocket._heartbeat = setInterval(() => {
+                        if (petSocket && petSocket.readyState === WebSocket.OPEN) {
+                            petSocket.send("ping");
+                        }
+                    }, 20000);
+                };
+
+                petSocket.onmessage = (event) => {
+                    const pet = JSON.parse(event.data);
+                    renderPet(pet);
+                };
+
+                petSocket.onclose = () => {
+                    if (petSocket && petSocket._heartbeat) {
+                        clearInterval(petSocket._heartbeat);
+                    }
+                    if (reconnectTimer) {
+                        clearTimeout(reconnectTimer);
+                    }
+                    reconnectTimer = setTimeout(connectPetSocket, 2000);
+                };
+
+                petSocket.onerror = () => {
+                    if (petSocket) {
+                        petSocket.close();
+                    }
+                };
+            }
+
+            async function action(url) {
+                const token = localStorage.getItem("access_token");
+                const petId = localStorage.getItem("selected_pet_id");
+
+                if (!token) {
+                    window.location.href = "/login";
+                    return;
+                }
+
+                const response = await fetch(url, {
+                    method: "POST",
+                    headers: {
+                        "Authorization": "Bearer " + token,
+                        "X-Pet-Id": petId
+                    }
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    document.getElementById("message").innerText = data.detail || "Ошибка действия";
+                    return;
+                }
+
+                document.getElementById("message").innerText = "Действие выполнено";
+            }
+
+            loadUser();
+            connectPetSocket();
+        </script>
+    </body>
+</html>
